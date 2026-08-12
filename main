@@ -1,0 +1,193 @@
+/*
+ * Simple Epilepsy Detection - Low Frequency Attack Detection
+ * 
+ * Connections:
+ * ADXL335 X-axis -> AN2 (Pin 6)
+ * ADXL335 Y-axis -> AN3 (Pin 7)
+ * Seizure LED -> RD2 (Pin 77)
+ */
+
+#include <xc.h>
+#include <sys/attribs.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#pragma config FNOSC = FRCPLL //use fast RC with PLL module
+#pragma config FSOSCEN = OFF
+#pragma config POSCMOD = XT
+#pragma config FWDTEN = OFF
+
+#pragma config FPLLIDIV = DIV_2 // Divide by 2
+#pragma config FPLLMUL = MUL_20 // Multiply by 20
+#pragma config FPLLODIV = DIV_1 // Divide by 1
+// In total multiply 8Mhz by 10
+
+#pragma config FPBDIV = DIV_1
+// Peripheral bus frequency same as system freq
+
+
+#define SYS_FREQ 80000000L // Sets the sys freq to 80MHz
+#define PB_FREQ (SYS_FREQ) // Note same freq as
+
+#define SEIZURE_LED LATDbits.LATD2
+
+#define SAMPLE_RATE 50            // Hz - low frequency sampling
+#define BUFFER_SIZE 100           // Sample buffer
+#define PEAK_THRESHOLD 30       // ADC value change for peak
+#define PEAK_COUNT_THRESHOLD 5    // Number of peaks to detect seizure
+#define PEAK_TIME_WINDOW 3000     // Time window in ms for peak counting
+
+// Universal Variables
+uint16_t x_buffer[BUFFER_SIZE];
+uint16_t y_buffer[BUFFER_SIZE];
+uint16_t buffer_idx = 0;
+uint16_t peak_count = 0;
+uint32_t last_peak_time = 0;
+bool seizure_active = false;
+
+void init_system(void);
+void init_adc(void);
+void init_timer(void);
+uint16_t read_adc(uint8_t channel);
+void detect_peaks(void);
+uint32_t get_millis(void);
+
+int main(void) {
+    init_system();
+    
+    while(1) {
+        // Main loop idle
+    }
+    
+    return 0;
+}
+
+void init_system(void) {
+    INTCONbits.MVEC = 1;                    // Enable multi-vector interrupts
+    __builtin_enable_interrupts();
+    
+    TRISDbits.TRISD2 = 0;                   // RD2 as output
+    SEIZURE_LED = 0;                        // LED off
+    
+    init_adc();
+    init_timer();
+}
+
+void init_adc(void) {
+    AD1CON1bits.ON = 0; // Turn off ADC
+    AD1CON1bits.FORM = 0; // 16-bit integer
+    AD1CON1bits.SSRC = 7; // Auto-convert
+    AD1CON1bits.ASAM = 0; // Manual sampling
+    
+    AD1CON2bits.VCFG = 0; // VDD/VSS reference
+    AD1CON2bits.CSCNA = 0; // No scanning
+    AD1CON2bits.SMPI = 0; // Interrupt each conversion
+    AD1CON2bits.BUFM = 0; // Single buffer
+    AD1CON2bits.ALTS = 0; // MUX A only
+    
+    AD1CON3bits.ADRC = 0; // Use PBCLK
+    AD1CON3bits.SAMC = 15; // 15 TAD sampling -> Fast Sampling
+    AD1CON3bits.ADCS = 2; // TAD timing
+    
+    // Accelerometer X and Y setting
+    AD1PCFGbits.PCFG2 = 0; // AN2 analog
+    AD1PCFGbits.PCFG3 = 0; // AN3 analog
+    
+    AD1CON1bits.ON = 1;                     // Turn on ADC
+}
+
+void init_timer(void) {
+    T2CONbits.ON = 0;                       // Turn off Timer2
+    T2CONbits.TCS = 0;                      // PBCLK source
+    T2CONbits.TCKPS = 0b111;                // 1:256 prescaler
+    TMR2 = 0;                               // Clear timer
+    PR2 = (PB_FREQ / 256 / SAMPLE_RATE) - 1; // Set period
+    
+    IPC2bits.T2IP = 5;                      // Priority 5
+    IFS0bits.T2IF = 0;                      // Clear flag
+    IEC0bits.T2IE = 1;                      // Enable interrupt
+    
+    T2CONbits.ON = 1;                       // Turn on Timer2
+}
+
+uint16_t read_adc(uint8_t channel) {
+    AD1CHSbits.CH0SA = channel;             // Select channel
+    AD1CON1bits.SAMP = 1;                   // Start sampling
+    for(int i = 0; i < 100; i++);           // Short delay
+    AD1CON1bits.SAMP = 0;                   // Start conversion
+    while(!AD1CON1bits.DONE);               // Wait for done
+    return ADC1BUF0;                        // Return result
+}
+
+void detect_peaks(void) {
+    if(buffer_idx < 3) return;              // Need minimum samples
+    
+    uint16_t curr_idx = (buffer_idx - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+    uint16_t prev_idx = (buffer_idx - 2 + BUFFER_SIZE) % BUFFER_SIZE;
+    uint16_t prev2_idx = (buffer_idx - 3 + BUFFER_SIZE) % BUFFER_SIZE;
+    
+    // Check X axis for peak
+    int16_t x_diff1 = x_buffer[curr_idx] - x_buffer[prev_idx];
+    int16_t x_diff2 = x_buffer[prev_idx] - x_buffer[prev2_idx];
+    
+    // Check Y axis for peak
+    int16_t y_diff1 = y_buffer[curr_idx] - y_buffer[prev_idx];
+    int16_t y_diff2 = y_buffer[prev_idx] - y_buffer[prev2_idx];
+    
+    bool x_peak = false;
+    bool y_peak = false;
+    
+    // Detect peak (direction change with threshold)
+    if((x_diff1 > PEAK_THRESHOLD && x_diff2 < -PEAK_THRESHOLD) || 
+       (x_diff1 < -PEAK_THRESHOLD && x_diff2 > PEAK_THRESHOLD)) {
+        x_peak = true;
+    }
+    
+    if((y_diff1 > PEAK_THRESHOLD && y_diff2 < -PEAK_THRESHOLD) || 
+       (y_diff1 < -PEAK_THRESHOLD && y_diff2 > PEAK_THRESHOLD)) {
+        y_peak = true;
+    }
+    
+    uint32_t current_time = get_millis();
+    
+    // Count peaks in time window
+    if(x_peak || y_peak) {
+        if(current_time - last_peak_time < PEAK_TIME_WINDOW) {
+            peak_count++;                   // Increment peak counter
+        } else {
+            peak_count = 1;                 // Reset counter if outside window
+        }
+        last_peak_time = current_time;
+    }
+    
+    // Check for seizure detection
+    if(peak_count >= PEAK_COUNT_THRESHOLD) {
+        seizure_active = true;              // Seizure detected
+        SEIZURE_LED = 1;                    // Turn on LED
+    }
+    
+    // Reset if no peaks for extended period
+    if(current_time - last_peak_time > PEAK_TIME_WINDOW * 2) {
+        peak_count = 0;                     // Reset peak count
+        seizure_active = false;             // Clear seizure flag
+        SEIZURE_LED = 0;                    // Turn off LED
+    }
+}
+
+uint32_t get_millis(void) {
+    return (_CP0_GET_COUNT() / (SYS_FREQ / 2000)); // Convert to milliseconds
+}
+
+// Interrupt over polling -> Faster CPU and less CPU power req
+void __ISR(_TIMER_2_VECTOR, IPL5SOFT) Timer2Handler(void) {
+    x_buffer[buffer_idx] = read_adc(2);     // Read X axis
+    y_buffer[buffer_idx] = read_adc(3);     // Read Y axis
+    
+    buffer_idx = (buffer_idx + 1) % BUFFER_SIZE; // Increment buffer index
+    
+    detect_peaks();                         // Check for peaks
+    
+    IFS0bits.T2IF = 0;                      // Clear interrupt flag
+}
+
+
